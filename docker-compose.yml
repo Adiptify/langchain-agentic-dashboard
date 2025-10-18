@@ -1,0 +1,40 @@
+version: '3.8'
+
+services:
+  langchain-dashboard:
+    build: .
+    ports:
+      - "8501:8501"
+    volumes:
+      - ./uploads:/app/uploads
+      - ./data:/app/data
+      - ./index:/app/index
+      - ./logs.db:/app/logs.db
+      - ./user_profiles.db:/app/user_profiles.db
+      - ./search_index.db:/app/search_index.db
+    environment:
+      - OLLAMA_BASE_URL=http://localhost:11434
+      - EMBED_MODEL=nomic-embed-text
+      - SLM_PARSE_MODEL=llama3.2:3b
+      - LLM_REASONING_MODEL=gpt-oss:120b-cloud
+    restart: unless-stopped
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://localhost:8501/_stcore/health"]
+      interval: 30s
+      timeout: 10s
+      retries: 3
+      start_period: 60s
+
+  # Optional: Separate Ollama service
+  ollama:
+    image: ollama/ollama:latest
+    ports:
+      - "11434:11434"
+    volumes:
+      - ollama_data:/root/.ollama
+    restart: unless-stopped
+    environment:
+      - OLLAMA_HOST=0.0.0.0
+
+volumes:
+  ollama_data:
