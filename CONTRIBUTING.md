@@ -264,8 +264,8 @@ Before submitting a PR:
 
 - **GitHub Issues**: For bugs and feature requests
 - **GitHub Discussions**: For questions and ideas
-- **Email**: your.email@example.com
-- **Discord**: [Join our community](https://discord.gg/your-invite)
+- **Email**: kumar.aditya.prof@gmail.com
+- **Discord**: [Join our community](https://discord.gg/uDwg5v7CXt)
 
 ## 🙏 Recognition
 
