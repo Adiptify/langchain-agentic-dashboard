@@ -314,15 +314,28 @@ def execute_advanced_search(query: str):
         results = embedding_store.search(optimized_query, k=5)
         
         # Execute based on route
-        if route == "agent_tools":
+        route_name = route.get("route", "unknown") if isinstance(route, dict) else route
+        
+        if route_name == "agent":
             result = agent_tools.execute_pandas_query(optimized_query, results)
-        elif route == "llm_reasoning":
+        elif route_name == "llm_reason":
+            result = llm_reasoning.perform_reasoning(optimized_query, results)
+        elif route_name == "llm_explain":
+            result = llm_reasoning.generate_explanation(optimized_query, results)
+        elif route_name == "slm_parse":
+            # For SLM parsing, we'll use the reasoning method with SLM model
             result = llm_reasoning.perform_reasoning(optimized_query, results)
         else:
-            result = {"response": "Query processed", "route": route}
+            result = {"response": f"Query processed via {route_name}", "route": route_name}
         
         # Verify result
-        verification = verifier.verify_reasoning_explanation(result.get("response", ""))
+        # Extract the actual response text from the result
+        response_text = result.get("response", result.get("answer", result.get("result", "")))
+        verification = verifier.verify_reasoning_explanation(
+            optimized_query, 
+            results, 
+            response_text
+        )
         
         processing_time = time.time() - start_time
         
@@ -349,8 +362,8 @@ def execute_advanced_search(query: str):
         st.session_state.conversation_history.append({
             "timestamp": datetime.now().isoformat(),
             "query": query,
-            "response": result.get("response", ""),
-            "route": route,
+            "response": response_text,
+            "route": route_name,
             "processing_time": processing_time,
             "results_count": len(results),
             "verification": verification,
@@ -358,7 +371,7 @@ def execute_advanced_search(query: str):
         })
         
         # Display results
-        display_search_results(result, results, route, processing_time, verification)
+        display_search_results(result, results, route_name, processing_time, verification)
         
     except Exception as e:
         processing_time = time.time() - start_time
@@ -394,7 +407,8 @@ def display_search_results(result: Dict, results: List, route: str,
     
     # Response
     st.markdown("**🤖 Response:**")
-    st.markdown(f'<div class="success-message">{result.get("response", "No response")}</div>', 
+    response_text = result.get("response", result.get("answer", result.get("result", "No response")))
+    st.markdown(f'<div class="success-message">{response_text}</div>', 
                 unsafe_allow_html=True)
     
     # Verification
