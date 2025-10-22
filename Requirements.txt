@@ -1,0 +1,8 @@
+langchain
+fastapi
+uvicorn
+pandas
+faiss-cpu
+numpy
+python-multipart
+openpyxl # For Excel file processing
