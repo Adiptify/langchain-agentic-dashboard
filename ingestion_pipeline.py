@@ -8,6 +8,7 @@ import numpy as np
 import json
 import requests
 import time
+import warnings
 
 from config import DATA_DIR, TRUSTED_FLAG_DEFAULT, TEXT_CHUNK_SIZE, TEXT_CHUNK_OVERLAP, OLLAMA_BASE_URL, SLM_PARSE_MODEL
 from utils import logger, log_process_completion
@@ -61,8 +62,9 @@ Summary:"""
                 "model": SLM_PARSE_MODEL,
                 "prompt": prompt,
                 "stream": False,
-                "options": {"num_gpu": 1}
-            }
+                "options": {"num_gpu": 1, "temperature": 0.1, "top_p": 0.9}
+            },
+            timeout=30  # Reduced timeout for faster processing
         )
         end_time = time.time()
         response.raise_for_status()
@@ -117,6 +119,209 @@ Summary:"""
             logger.error(f"Ollama SLM error response body: {e.response.text}")
         return str(filtered_row_data) # Fallback to string representation
 
+def _smart_excel_processing(file_path: str, sheet_name: str, row_limit: int = None) -> pd.DataFrame:
+    """Smart Excel processing with intelligent header detection and structure analysis"""
+    try:
+        # Step 1: Analyze the raw structure
+        df_raw = pd.read_excel(file_path, sheet_name=sheet_name, header=None, nrows=10)
+        structure_analysis = _analyze_excel_structure(df_raw)
+        
+        logger.info(f"Excel structure analysis for {sheet_name}: {structure_analysis}")
+        
+        # Step 2: Choose the best processing method
+        if structure_analysis['complexity_score'] > 5:
+            # Complex structure - use advanced processing
+            df = _process_complex_excel_structure(file_path, sheet_name, structure_analysis)
+        elif structure_analysis['has_multi_level_headers']:
+            # Multi-level headers
+            df = pd.read_excel(file_path, sheet_name=sheet_name, header=structure_analysis['header_rows'])
+            df.columns = _flatten_multiindex_columns(df.columns)
+        else:
+            # Simple structure
+            df = pd.read_excel(file_path, sheet_name=sheet_name, header=structure_analysis['header_rows'][0])
+            df.columns = _normalize_headers(df.columns)
+        
+        # Step 3: Clean and validate
+        df = _clean_dataframe(df)
+        
+        # Step 4: Apply row limit if specified
+        if row_limit and len(df) > row_limit:
+            df = df.head(row_limit)
+        
+        logger.info(f"Successfully processed {sheet_name}: {len(df)} rows, {len(df.columns)} columns")
+        logger.info(f"Sample columns: {list(df.columns)[:5]}")
+        
+        return df
+        
+    except Exception as e:
+        logger.error(f"Smart Excel processing failed for {sheet_name}: {e}")
+        # Fallback to simple processing
+        try:
+            df = pd.read_excel(file_path, sheet_name=sheet_name, header=0)
+            df.columns = _normalize_headers(df.columns)
+            return df.head(row_limit) if row_limit else df
+        except Exception as e2:
+            logger.error(f"Fallback processing also failed: {e2}")
+            return None
+
+def _analyze_excel_structure(df_raw: pd.DataFrame) -> dict:
+    """Analyze Excel structure to determine complexity and processing strategy"""
+    analysis = {
+        'header_rows': [],
+        'data_start_row': 0,
+        'has_multi_level_headers': False,
+        'has_merged_cells': False,
+        'complexity_score': 0,
+        'recommended_method': 'simple'
+    }
+    
+    # Analyze first 8 rows
+    for i in range(min(8, len(df_raw))):
+        row = df_raw.iloc[i]
+        non_null_count = row.notna().sum()
+        
+        if non_null_count == 0:
+            continue
+        
+        # Count text vs numeric values
+        text_count = 0
+        numeric_count = 0
+        for val in row:
+            if pd.notna(val):
+                val_str = str(val).strip()
+                if val_str and not val_str.replace('.', '').replace('-', '').isdigit():
+                    text_count += 1
+                else:
+                    numeric_count += 1
+        
+        text_ratio = text_count / non_null_count if non_null_count > 0 else 0
+        
+        # Detect header characteristics
+        if text_ratio > 0.6:  # Mostly text = likely header
+            analysis['header_rows'].append(i)
+            
+            # Check for merged cells (sparse distribution)
+            if text_count > 0 and text_count < non_null_count * 0.4:
+                analysis['has_merged_cells'] = True
+                
+        elif text_ratio < 0.3 and numeric_count > 0:  # Mostly numeric = likely data
+            if analysis['data_start_row'] == 0:
+                analysis['data_start_row'] = i
+            break
+    
+    # Determine complexity
+    analysis['has_multi_level_headers'] = len(analysis['header_rows']) > 1
+    analysis['complexity_score'] = (
+        len(analysis['header_rows']) * 2 +
+        (1 if analysis['has_merged_cells'] else 0) * 3 +
+        (1 if analysis['has_multi_level_headers'] else 0) * 2
+    )
+    
+    # Choose processing method
+    if analysis['complexity_score'] > 5:
+        analysis['recommended_method'] = 'complex'
+    elif analysis['has_multi_level_headers']:
+        analysis['recommended_method'] = 'multi_level'
+    else:
+        analysis['recommended_method'] = 'simple'
+    
+    # Ensure we have at least one header row
+    if not analysis['header_rows']:
+        analysis['header_rows'] = [0]
+    
+    return analysis
+
+def _process_complex_excel_structure(file_path: str, sheet_name: str, analysis: dict) -> pd.DataFrame:
+    """Process complex Excel structures with advanced techniques"""
+    try:
+        # Try different header combinations
+        for header_combo in [
+            analysis['header_rows'],
+            [0, 1] if len(analysis['header_rows']) > 1 else [0],
+            [0]
+        ]:
+            try:
+                df = pd.read_excel(file_path, sheet_name=sheet_name, header=header_combo)
+                
+                # Handle MultiIndex columns
+                if isinstance(df.columns, pd.MultiIndex):
+                    df.columns = _flatten_multiindex_columns(df.columns)
+                else:
+                    df.columns = _normalize_headers(df.columns)
+                
+                # Validate the result
+                if len(df.columns) > 0 and not df.empty:
+                    return df
+                    
+            except Exception as e:
+                logger.debug(f"Header combo {header_combo} failed: {e}")
+                continue
+        
+        # Final fallback
+        df = pd.read_excel(file_path, sheet_name=sheet_name, header=0)
+        df.columns = _normalize_headers(df.columns)
+        return df
+        
+    except Exception as e:
+        logger.error(f"Complex structure processing failed: {e}")
+        raise
+
+def _flatten_multiindex_columns(columns: pd.MultiIndex) -> List[str]:
+    """Flatten multi-level column names into meaningful single names"""
+    flattened = []
+    
+    for col in columns:
+        if isinstance(col, tuple):
+            # Join non-null parts with underscore
+            parts = []
+            for part in col:
+                if pd.notna(part) and str(part).strip():
+                    parts.append(str(part).strip())
+            
+            if parts:
+                col_name = '_'.join(parts)
+            else:
+                col_name = f"column_{len(flattened)}"
+        else:
+            col_name = str(col).strip() if pd.notna(col) else f"column_{len(flattened)}"
+        
+        flattened.append(_normalize_header(col_name))
+    
+    return flattened
+
+def _normalize_headers(headers: List[str]) -> List[str]:
+    """Normalize a list of headers"""
+    return [_normalize_header(str(header)) for header in headers]
+
+def _clean_dataframe(df: pd.DataFrame) -> pd.DataFrame:
+    """Clean and validate the processed dataframe"""
+    # Remove completely empty rows and columns
+    df = df.dropna(how='all').dropna(axis=1, how='all')
+    
+    # Remove duplicate columns
+    df = df.loc[:, ~df.columns.duplicated()]
+    
+    # Ensure column names are unique
+    df.columns = _make_unique_columns(df.columns)
+    
+    return df
+
+def _make_unique_columns(columns: List[str]) -> List[str]:
+    """Ensure all column names are unique"""
+    unique_columns = []
+    seen = set()
+    
+    for col in columns:
+        original_col = col
+        counter = 1
+        while col in seen:
+            col = f"{original_col}_{counter}"
+            counter += 1
+        seen.add(col)
+        unique_columns.append(col)
+    
+    return unique_columns
+
 def _normalize_header(header: str) -> str:
     """
     Normalizes a header string to snake_case.
@@ -132,9 +337,9 @@ def _detect_column_type(series: pd.Series):
     """
     # Try numeric
     try:
-        pd.to_numeric(series)
+        pd.to_numeric(series, errors='raise')
         return "number"
-    except ValueError:
+    except (ValueError, TypeError):
         pass
     
     # Try datetime
@@ -165,7 +370,9 @@ def _detect_column_type(series: pd.Series):
             return "datetime"
         
         # Fallback to general coercion if no specific format yielded good results but general one might
-        converted_series_general = pd.to_datetime(series, errors='coerce')
+        with warnings.catch_warnings():
+            warnings.simplefilter("ignore", UserWarning)  # Suppress date parsing warnings
+            converted_series_general = pd.to_datetime(series, errors='coerce')
         if converted_series_general.count() / len(series) > 0.5:
             return "datetime"
         
@@ -241,8 +448,14 @@ def _process_dataframe(df: pd.DataFrame, file_id: str, file_name: str, sheet_nam
             if diff_col and not pd.isna(diff_val):
                 row_summary_parts.append(f"both day difference {str(diff_val).strip()} KWH")
 
-        # Use SLM to generate a natural language summary for the row
-        row_summary_content = _get_slm_summary(row.to_dict(), column_types)
+        # Use SLM to generate a natural language summary for the row (only for important rows)
+        # Skip SLM for rows with mostly NaN values or header rows
+        non_nan_count = sum(1 for v in row.values if pd.notna(v))
+        if non_nan_count >= 3:  # Only process rows with at least 3 non-NaN values
+            row_summary_content = _get_slm_summary(row.to_dict(), column_types)
+        else:
+            # Use simple template-based summary for less important rows
+            row_summary_content = " ".join(row_summary_parts) if row_summary_parts else str(row.to_dict())
 
         metadata = {
             "file_id": file_id,
@@ -358,10 +571,9 @@ def ingest_file(file_path: str, file_id: str = None, row_limit: Optional[int] = 
                 xl = pd.ExcelFile(file_path)
                 # Process only the first two sheets as requested
                 for sheet_name in xl.sheet_names[:2]: # Limit to first 2 sheets
-                    df_sheet = xl.parse(sheet_name)
-                    if row_limit: # Apply row limit if provided
-                        df_sheet = df_sheet.head(row_limit)
-                    all_documents.extend(_process_dataframe(df_sheet, file_id, file_name, sheet_name=sheet_name))
+                    df_sheet = _smart_excel_processing(file_path, sheet_name, row_limit)
+                    if df_sheet is not None and not df_sheet.empty:
+                        all_documents.extend(_process_dataframe(df_sheet, file_id, file_name, sheet_name=sheet_name))
             
             if df is not None: # For CSVs that are processed directly
                 if row_limit: # Apply row limit if provided

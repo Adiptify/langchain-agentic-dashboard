@@ -182,6 +182,13 @@ class EmbeddingStore:
             if doc_idx == -1: # FAISS returns -1 for unpopulated indices
                 continue
 
+            # Calculate similarity score (1 - distance for cosine similarity)
+            similarity_score = 1 - float(D[0][i])
+            
+            # Only include results with reasonable similarity (threshold of 0.1)
+            if similarity_score < 0.1:
+                continue
+
             doc_id = self.faiss_id_to_doc_id.get(str(doc_idx))
             if doc_id:
                 cursor.execute("SELECT file_id, file_name, doc_type, content, metadata FROM documents WHERE doc_id = ?", (doc_id,))
@@ -197,7 +204,8 @@ class EmbeddingStore:
                             "doc_type": doc_type,
                             "content": content,
                             "metadata": json.loads(metadata_str),
-                            "distance": float(D[0][i])
+                            "distance": float(D[0][i]),
+                            "score": similarity_score
                         })
         conn.close()
         return results
