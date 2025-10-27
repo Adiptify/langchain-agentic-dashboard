@@ -2,6 +2,7 @@ import pandas as pd
 from typing import Dict, Any, List
 import json
 import sqlite3
+import re
 
 from config import METADATA_DB_PATH
 from utils import logger
@@ -12,6 +13,96 @@ class AgentTools:
     can execute to answer queries or retrieve specific data.
     These tools operate on the ingested data and its metadata.
     """
+    def execute_pandas_operation(self, operation: str, metric: str, equipment_terms: List[str], 
+                                date_range: tuple = None, context_rows: List[Dict] = None) -> Dict[str, Any]:
+        """
+        Execute specific pandas operations based on SLM-extracted parameters.
+        This is the enhanced version that works with SLM router results.
+        """
+        try:
+            if not context_rows:
+                return {"error": "No context rows provided", "value": None}
+            
+            # Extract numeric values from context rows
+            numeric_values = []
+            column_used = None
+            
+            for row in context_rows:
+                content = row.get('content', '')
+                metadata = row.get('metadata', {})
+                
+                # Look for metric-related columns
+                # Map common energy metrics to content patterns
+                energy_patterns = ['energy', 'consumption', 'kwh', 'kwh', 'power', 'mwh']
+                metric_found = False
+                
+                if metric:
+                    # Check if metric or related terms are in content
+                    for pattern in energy_patterns:
+                        if pattern in content.lower() or metric.lower() in content.lower():
+                            metric_found = True
+                            break
+                
+                if metric_found:
+                    # Extract numeric values from content
+                    numbers = re.findall(r'(\d+(?:\.\d+)?)', content)
+                    for num in numbers:
+                        try:
+                            val = float(num)
+                            # Filter reasonable energy values (10-1000000)
+                            if 10 <= val <= 1000000:
+                                numeric_values.append(val)
+                                if not column_used:
+                                    column_used = metric
+                        except ValueError:
+                            continue
+                
+                # Also check metadata for numeric fields
+                if isinstance(metadata, dict):
+                    numeric_fields = metadata.get('numeric_fields', [])
+                    for field in numeric_fields:
+                        if metric.lower() in field.lower() or 'energy' in field.lower() or 'consumption' in field.lower():
+                            # Try to extract value from content
+                            pattern = rf"{field}:\s*(\d+(?:\.\d+)?)"
+                            match = re.search(pattern, content, re.IGNORECASE)
+                            if match:
+                                try:
+                                    numeric_values.append(float(match.group(1)))
+                                    column_used = field
+                                except ValueError:
+                                    continue
+            
+            if not numeric_values:
+                return {"error": f"No numeric values found for metric '{metric}'", "value": None}
+            
+            # Perform operation
+            if operation.lower() in ['avg', 'average', 'mean']:
+                result_value = sum(numeric_values) / len(numeric_values)
+            elif operation.lower() in ['sum', 'total']:
+                result_value = sum(numeric_values)
+            elif operation.lower() == 'max':
+                result_value = max(numeric_values)
+            elif operation.lower() == 'min':
+                result_value = min(numeric_values)
+            elif operation.lower() == 'count':
+                result_value = len(numeric_values)
+            else:
+                result_value = sum(numeric_values) / len(numeric_values)  # Default to average
+            
+            return {
+                "value": result_value,
+                "operation": operation,
+                "metric": metric,
+                "column_used": column_used,
+                "count": len(numeric_values),
+                "equipment_terms": equipment_terms,
+                "matched_rows": len(context_rows)
+            }
+            
+        except Exception as e:
+            logger.error(f"Pandas operation failed: {e}")
+            return {"error": str(e), "value": None}
+
     def __init__(self):
         logger.info("AgentTools initialized.")
 

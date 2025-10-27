@@ -10,6 +10,21 @@ import requests
 import time
 import warnings
 
+# Additional imports for file processing
+try:
+    import PyPDF2
+    PDF_AVAILABLE = True
+except ImportError:
+    PDF_AVAILABLE = False
+    warnings.warn("PyPDF2 not available. PDF processing disabled.")
+
+try:
+    from docx import Document as DocxDocument
+    DOCX_AVAILABLE = True
+except ImportError:
+    DOCX_AVAILABLE = False
+    warnings.warn("python-docx not available. DOCX processing disabled.")
+
 from config import DATA_DIR, TRUSTED_FLAG_DEFAULT, TEXT_CHUNK_SIZE, TEXT_CHUNK_OVERLAP, OLLAMA_BASE_URL, SLM_PARSE_MODEL
 from utils import logger, log_process_completion
 
@@ -551,6 +566,153 @@ def _chunk_text(text: str, file_id: str, file_name: str, page_no: int = None, se
         chunks.append(Document(doc_id=str(uuid.uuid4()), file_id=file_id, file_name=file_name, doc_type="text_chunk", content=content, metadata=metadata))
     return chunks
 
+def _process_pdf_file(file_path: str, file_id: str, file_name: str) -> List[Document]:
+    """Process PDF file and extract text content"""
+    if not PDF_AVAILABLE:
+        logger.warning("PDF processing not available. Install PyPDF2 to process PDF files.")
+        return []
+    
+    documents = []
+    try:
+        with open(file_path, 'rb') as file:
+            pdf_reader = PyPDF2.PdfReader(file)
+            
+            for page_num, page in enumerate(pdf_reader.pages):
+                text = page.extract_text()
+                if text.strip():
+                    # Create metadata for each page
+                    metadata = {
+                        "page_number": page_num + 1,
+                        "total_pages": len(pdf_reader.pages),
+                        "file_type": "pdf",
+                        "created_at": datetime.now().isoformat(),
+                        "trusted": TRUSTED_FLAG_DEFAULT,
+                        "doc_type": "text_chunk",
+                    }
+                    
+                    # Chunk the page text if it's too long
+                    if len(text) > TEXT_CHUNK_SIZE:
+                        chunks = _chunk_text(text, file_id, file_name)
+                        documents.extend(chunks)
+                    else:
+                        doc = Document(
+                            doc_id=str(uuid.uuid4()),
+                            file_id=file_id,
+                            file_name=file_name,
+                            doc_type="text_chunk",
+                            content=text,
+                            metadata=metadata
+                        )
+                        documents.append(doc)
+        
+        logger.info(f"Processed PDF file: {file_name} - {len(documents)} documents created")
+        return documents
+        
+    except Exception as e:
+        logger.error(f"Error processing PDF file {file_name}: {e}")
+        return []
+
+def _process_docx_file(file_path: str, file_id: str, file_name: str) -> List[Document]:
+    """Process DOCX file and extract text content"""
+    if not DOCX_AVAILABLE:
+        logger.warning("DOCX processing not available. Install python-docx to process DOCX files.")
+        return []
+    
+    documents = []
+    try:
+        doc = DocxDocument(file_path)
+        
+        # Extract text from paragraphs
+        full_text = []
+        for paragraph in doc.paragraphs:
+            if paragraph.text.strip():
+                full_text.append(paragraph.text.strip())
+        
+        # Extract text from tables
+        for table in doc.tables:
+            for row in table.rows:
+                row_text = []
+                for cell in row.cells:
+                    if cell.text.strip():
+                        row_text.append(cell.text.strip())
+                if row_text:
+                    full_text.append(" | ".join(row_text))
+        
+        combined_text = "\n".join(full_text)
+        
+        if combined_text.strip():
+            # Create metadata
+            metadata = {
+                "file_type": "docx",
+                "paragraph_count": len(doc.paragraphs),
+                "table_count": len(doc.tables),
+                "created_at": datetime.now().isoformat(),
+                "trusted": TRUSTED_FLAG_DEFAULT,
+                "doc_type": "text_chunk",
+            }
+            
+            # Chunk the text if it's too long
+            if len(combined_text) > TEXT_CHUNK_SIZE:
+                chunks = _chunk_text(combined_text, file_id, file_name)
+                documents.extend(chunks)
+            else:
+                doc_obj = Document(
+                    doc_id=str(uuid.uuid4()),
+                    file_id=file_id,
+                    file_name=file_name,
+                    doc_type="text_chunk",
+                    content=combined_text,
+                    metadata=metadata
+                )
+                documents.append(doc_obj)
+        
+        logger.info(f"Processed DOCX file: {file_name} - {len(documents)} documents created")
+        return documents
+        
+    except Exception as e:
+        logger.error(f"Error processing DOCX file {file_name}: {e}")
+        return []
+
+def _process_other_text_file(file_path: str, file_id: str, file_name: str) -> List[Document]:
+    """Process other text-based files (log files, etc.)"""
+    documents = []
+    try:
+        # Try different encodings
+        encodings = ['utf-8', 'latin-1', 'cp1252', 'iso-8859-1']
+        text_content = None
+        
+        for encoding in encodings:
+            try:
+                with open(file_path, 'r', encoding=encoding) as f:
+                    text_content = f.read()
+                break
+            except UnicodeDecodeError:
+                continue
+        
+        if text_content is None:
+            logger.error(f"Could not decode file {file_name} with any supported encoding")
+            return []
+        
+        # Create metadata
+        metadata = {
+            "file_type": file_path.split('.')[-1].lower(),
+            "encoding": encoding,
+            "created_at": datetime.now().isoformat(),
+            "trusted": TRUSTED_FLAG_DEFAULT,
+            "doc_type": "text_chunk",
+        }
+        
+        # Chunk the text
+        chunks = _chunk_text(text_content, file_id, file_name)
+        documents.extend(chunks)
+        
+        logger.info(f"Processed text file: {file_name} - {len(documents)} documents created")
+        return documents
+        
+    except Exception as e:
+        logger.error(f"Error processing text file {file_name}: {e}")
+        return []
+
 def ingest_file(file_path: str, file_id: str = None, row_limit: Optional[int] = None) -> List[Document]:
     """
     Ingests a single file, processes it based on type, and returns a list of Documents.
@@ -580,11 +742,24 @@ def ingest_file(file_path: str, file_id: str = None, row_limit: Optional[int] = 
                     df = df.head(row_limit)
                 all_documents.extend(_process_dataframe(df, file_id, file_name))
 
+        elif file_path.endswith('.pdf'):
+            all_documents.extend(_process_pdf_file(file_path, file_id, file_name))
+            log_process_completion(f"Ingestion of PDF: {file_name}", details="Processed as PDF document")
+
+        elif file_path.endswith('.docx'):
+            all_documents.extend(_process_docx_file(file_path, file_id, file_name))
+            log_process_completion(f"Ingestion of DOCX: {file_name}", details="Processed as DOCX document")
+
         elif file_path.endswith('.txt'):
             with open(file_path, 'r', encoding='utf-8') as f:
                 text_content = f.read()
             all_documents.extend(_chunk_text(text_content, file_id, file_name))
             log_process_completion(f"Ingestion of TXT: {file_name}", details="Processed as textual data")
+
+        elif file_path.endswith(('.log', '.md', '.json', '.xml', '.yaml', '.yml')):
+            all_documents.extend(_process_other_text_file(file_path, file_id, file_name))
+            log_process_completion(f"Ingestion of {file_name.split('.')[-1].upper()}: {file_name}", details="Processed as text document")
+
         else:
             logger.warning(f"Unsupported file type for ingestion: {file_name}")
             log_process_completion(f"Ingestion of {file_name}", status="skipped", details="Unsupported file type")

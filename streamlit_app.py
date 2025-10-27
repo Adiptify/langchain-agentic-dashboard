@@ -1,3 +1,167 @@
+import warnings
+warnings.filterwarnings("ignore", category=DeprecationWarning, module="plotly")
+
+def get_dynamic_equipment_list():
+    """Extract actual equipment names from database dynamically"""
+    try:
+        conn = sqlite3.connect('data_prototype/metadata.db')
+        cursor = conn.cursor()
+        
+        # Get unique equipment names from content
+        cursor.execute("""
+            SELECT DISTINCT content 
+            FROM documents 
+            WHERE doc_type='row' 
+            AND content IS NOT NULL 
+            AND content != ''
+            LIMIT 50
+        """)
+        
+        equipment_list = []
+        for (content,) in cursor.fetchall():
+            if isinstance(content, str) and len(content) > 10:
+                # Extract equipment names from content
+                import re
+                equipment_patterns = [
+                    r'[A-Z]{2,4}\s*[M/C|MACHINE|M/C]\s*[A-Z0-9\-]+',
+                    r'[A-Z]{2,4}\s*[A-Z0-9\-]+\s*[A-Z0-9\-]*',
+                    r'[A-Z]{2,4}\s*Panel',
+                    r'[A-Z]{2,4}\s*FDR',
+                    r'[A-Z]{2,4}\s*Relay'
+                ]
+                
+                for pattern in equipment_patterns:
+                    matches = re.findall(pattern, content)
+                    for match in matches:
+                        if match not in equipment_list and len(match) > 5:
+                            equipment_list.append(match.strip())
+        
+        conn.close()
+        
+        # Remove duplicates and sort
+        equipment_list = sorted(list(set(equipment_list)))
+        
+        # If no equipment found, return default list
+        if not equipment_list:
+            equipment_list = [
+                "I/C Panel Numerical Relay",
+                "I/C Panel", 
+                "SCP M/C FDR-2 TO ISOLATOR ROOM",
+                "RADIAL FDR-1 FoR 6.6KV SWBD-3",
+                "INCOMER-1 FROM 25MVA TRANSFO 1T"
+            ]
+        
+        return equipment_list[:20]  # Limit to 20 items
+        
+    except Exception as e:
+        print(f"Error extracting equipment: {e}")
+        return [
+            "I/C Panel Numerical Relay",
+            "I/C Panel", 
+            "SCP M/C FDR-2 TO ISOLATOR ROOM",
+            "RADIAL FDR-1 FoR 6.6KV SWBD-3",
+            "INCOMER-1 FROM 25MVA TRANSFO 1T"
+        ]
+
+def normalize_query_terms(text: str) -> str:
+    """Normalize common plant synonyms to improve recall."""
+    synonyms = [
+        (r"\bsvp\b", "scp"),
+        (r"\bmachine\b", "m/c"),
+        (r"\bfeeder\b", "fdr"),
+        (r"\bisolator\s*room\b", "isolator room"),
+        (r"\bpfcs\b", "pfcs"),
+    ]
+    t = text.lower()
+    for pat, rep in synonyms:
+        t = re.sub(pat, rep, t)
+    return t
+
+def extract_search_terms_from_router(router_result: dict) -> str:
+    """Extract search terms from SLM router result"""
+    equipment = router_result.get('equipment', [])
+    dates = router_result.get('dates', [])
+    metric = router_result.get('metric', '')
+    
+    search_terms = []
+    
+    # Add equipment terms
+    if equipment:
+        search_terms.extend(equipment)
+    
+    # Add dates (filter out None values)
+    if dates:
+        search_terms.extend([d for d in dates if d is not None])
+    
+    # Add metric if relevant
+    if metric and metric.lower() in ['energy', 'consumption', 'power']:
+        search_terms.append(metric)
+    
+    # Fallback to original extraction if no SLM terms
+    if not search_terms:
+        return extract_search_terms_fallback("")
+    
+    return ' '.join(search_terms).strip()
+
+def extract_search_terms_fallback(query: str) -> str:
+    """Fallback extraction using regex patterns"""
+    import re
+    
+    # Extract equipment/feeder patterns
+    equipment_patterns = [
+        r'[A-Z]{2,4}\s*[M/C|MACHINE|M/C]\s*[A-Z0-9\-]+',  # SCP M/C FDR-2, SVP MACHINE -3
+        r'[A-Z]{2,4}\s*[A-Z0-9\-]+\s*[A-Z0-9\-]*',        # General equipment codes
+        r'[a-z\s]+room',                                    # isolator room, control room
+        r'[a-z\s]+panel',                                   # feeder panel, control panel
+        r'[a-z\s]+oven',                                    # coke oven, etc.
+        r'fdr[- ]?\d+',                                     # fdr-2, fdr 2
+        r'[A-Z]{2,4}[- ]?\d+',                             # SCP-2, SVP-3
+    ]
+    
+    # Extract date patterns
+    date_patterns = [
+        r'\d{4}[-/]\d{2}[-/]\d{2}',  # 2025-09-22, 2025/09/22
+        r'\d{2}[-/]\d{2}[-/]\d{4}',  # 22-09-2025, 22/09/2025
+        r'\d{1,2}[-/]\d{1,2}[-/]\d{4}',  # 9/22/2025
+    ]
+    
+    search_terms = []
+    
+    # Extract equipment terms
+    for pattern in equipment_patterns:
+        matches = re.findall(pattern, query, re.IGNORECASE)
+        search_terms.extend(matches)
+    
+    # Extract date terms
+    for pattern in date_patterns:
+        matches = re.findall(pattern, query)
+        search_terms.extend(matches)
+    
+    # If no specific patterns found, fall back to normalized query
+    if not search_terms:
+        return normalize_query_terms(query)
+    
+    # Join and clean up
+    result = ' '.join(search_terms).strip()
+    return result if result else normalize_query_terms(query)
+
+def suggest_similar_terms(query: str, limit: int = 5):
+    """Suggest similar equipment/feeder terms from the DB using fuzzy matching."""
+    try:
+        conn = sqlite3.connect('data_prototype/metadata.db')
+        cursor = conn.cursor()
+        cursor.execute("SELECT content FROM documents WHERE doc_type='row' LIMIT 2000")
+        rows = [r[0] for r in cursor.fetchall()]
+        conn.close()
+        # Extract candidate terms (tokens with letters/numbers and dashes)
+        tokens = set()
+        for c in rows:
+            for tok in re.findall(r"[A-Za-z][A-Za-z0-9\-/]+", c)[:20]:
+                if len(tok) >= 3:
+                    tokens.add(tok.lower())
+        return difflib.get_close_matches(query.lower(), list(tokens), n=limit, cutoff=0.6)
+    except Exception:
+        return []
 """
 Advanced Streamlit Dashboard for LangChain Agentic System
 Features: User profiles, advanced search, comprehensive logging, personalization
@@ -27,9 +191,15 @@ from agent_tools import AgentTools
 from llm_reasoning import LLMReasoning
 from verifier import Verifier
 from ingestion_pipeline import ingest_file
+import hashlib
+import difflib
+import re
+from datetime import datetime, timedelta
+import hashlib
 from advanced_logging import advanced_logger
 from user_profiles import user_profile_manager
 from advanced_search import advanced_search_engine, SearchFilter
+from response_generator import response_generator
 
 # Page configuration
 st.set_page_config(
@@ -249,6 +419,38 @@ def login_user():
         st.sidebar.success("Database reset! Please refresh the page.")
         st.rerun()
     
+    # Add time series interface to sidebar
+    render_time_series_interface()
+
+def render_time_series_interface():
+    """Render time series query interface in sidebar"""
+    
+    with st.sidebar:
+        st.markdown("### 📊 Time Series Explorer")
+        
+        # Dynamic equipment selection
+        equipment_options = get_dynamic_equipment_list()
+        
+        selected_equipment = st.selectbox("Equipment:", equipment_options)
+        
+        # Time period
+        time_period = st.selectbox("Period:", ["Daily", "Weekly", "Monthly"])
+        
+        # Date range
+        start_date = st.date_input("Start Date:", value=None)
+        end_date = st.date_input("End Date:", value=None)
+        
+        if st.button("🔍 Generate Query"):
+            if time_period == "Daily":
+                query = f"Show me daily energy consumption for {selected_equipment}"
+            elif time_period == "Weekly":
+                query = f"Show me weekly energy consumption for {selected_equipment}"
+            else:
+                query = f"Show me monthly energy consumption for {selected_equipment}"
+            
+            st.session_state.suggested_query = query
+            st.success("Query generated! Check the chat box.")
+    
     # Login form
     with st.sidebar.form("login_form"):
         username = st.text_input("Username", placeholder="Enter your username")
@@ -305,12 +507,23 @@ def render_advanced_search():
     """Render advanced search interface with autocomplete and filters"""
     st.markdown("### 🔍 Advanced Search")
     
+    # Add KPI suggestion box above search
+    render_kpi_suggestion_box()
+    
     # Search input with autocomplete
     col1, col2 = st.columns([3, 1])
     
     with col1:
+        # Check for suggested query
+        if 'suggested_query' in st.session_state:
+            default_query = st.session_state.suggested_query
+            del st.session_state.suggested_query  # Clear after use
+        else:
+            default_query = st.session_state.get('trigger_search', '')
+        
         query_input = st.text_input(
             "Enter your query",
+            value=default_query,
             placeholder="What is the total energy consumption?",
             key="search_query"
         )
@@ -320,7 +533,7 @@ def render_advanced_search():
             if query_input:
                 execute_advanced_search(query_input)
     
-    # Autocomplete suggestions
+    # Autocomplete suggestions and synonym normalization
     if query_input and len(query_input) >= 2:
         suggestions = advanced_search_engine.get_autocomplete_suggestions(query_input, limit=5)
         
@@ -328,54 +541,19 @@ def render_advanced_search():
             st.markdown("**💡 Suggestions:**")
             for suggestion in suggestions:
                 if st.button(f"{suggestion.text} ({suggestion.type})", key=f"suggestion_{suggestion.text}"):
-                    st.session_state.search_query = suggestion.text
+                    st.session_state.trigger_search = suggestion.text
                     st.rerun()
     
-    # Advanced filters
+    # Advanced filters (date filter removed per request)
     with st.expander("🎛️ Advanced Filters", expanded=False):
         col1, col2, col3 = st.columns(3)
         
         with col1:
-            # Date range filter
             st.markdown("**📅 Date Range**")
-            date_range = st.date_input(
-                "Select date range",
-                value=(datetime.now() - timedelta(days=30), datetime.now()),
-                key="date_filter"
-            )
-            
-            if date_range[0] and date_range[1]:
-                # Check if date range filter already exists
-                existing_date_filter = None
-                for f in st.session_state.active_filters:
-                    if f.filter_type == "date_range":
-                        existing_date_filter = f
-                        break
-                
-                if existing_date_filter:
-                    # Update existing filter
-                    existing_date_filter.parameters = {
-                        "start_date": date_range[0].isoformat(),
-                        "end_date": date_range[1].isoformat()
-                    }
-                else:
-                    # Create new filter
-                    filter_obj = SearchFilter(
-                        filter_id=str(uuid.uuid4()),
-                        name="Date Range Filter",
-                        filter_type="date_range",
-                        parameters={
-                            "start_date": date_range[0].isoformat(),
-                            "end_date": date_range[1].isoformat()
-                        }
-                    )
-                    st.session_state.active_filters.append(filter_obj)
-            
-            # Add remove button for date range filter
+            st.info("Date filter disabled to avoid unintended filtering.")
+            # Ensure any lingering date_range filters are cleared
             if any(f.filter_type == "date_range" for f in st.session_state.active_filters):
-                if st.button("🗑️ Remove Date Range Filter", key="remove_date_filter"):
-                    st.session_state.active_filters = [f for f in st.session_state.active_filters if f.filter_type != "date_range"]
-                    st.rerun()
+                st.session_state.active_filters = [f for f in st.session_state.active_filters if f.filter_type != "date_range"]
         
         with col2:
             # File type filter
@@ -452,13 +630,18 @@ def execute_advanced_search(query: str):
     start_time = time.time()
     
     try:
+        # Remove any date_range filters globally (disabled)
+        if 'active_filters' in st.session_state and st.session_state.active_filters:
+            st.session_state.active_filters = [f for f in st.session_state.active_filters if f.filter_type != 'date_range']
+        
         # Apply filters
         filtered_query, filter_metadata = advanced_search_engine.apply_filters(
             query, st.session_state.active_filters
         )
         
-        # Optimize query
+        # Optimize query and normalize synonyms
         optimized_query = advanced_search_engine.optimize_query(filtered_query)
+        optimized_query = normalize_query_terms(optimized_query)
         
         # Log query pattern
         advanced_search_engine.log_query_pattern(query, True)
@@ -486,41 +669,79 @@ def execute_advanced_search(query: str):
         progress_bar = st.progress(0)
         status_text = st.empty()
         
-        # Route query
-        status_text.text("🔍 Routing query...")
+        # Route query using SLM
+        status_text.text("🔍 Routing query with SLM...")
         progress_bar.progress(20)
-        route = router.route_query(optimized_query)
+        route_result = router.route_query(optimized_query)
         
-        # Get context (reduced from 5 to 3 for faster processing)
+        # Extract search terms from SLM router result
+        search_terms = extract_search_terms_from_router(route_result)
+        st.info(f"🔍 SLM extracted: {search_terms}")
+        st.info(f"🎯 Equipment: {route_result.get('equipment', [])}")
+        st.info(f"📅 Dates: {route_result.get('dates', [])}")
+        st.info(f"⚙️ Operation: {route_result.get('operation', '')}")
+        
+        # Get context using SLM-extracted search terms
         status_text.text("📚 Searching documents...")
         progress_bar.progress(40)
-        results = embedding_store.search(optimized_query, k=3)
+        results = embedding_store.search(search_terms, k=8)
         
         # Check if no relevant results found
         if not results:
-            status_text.text("⚠️ No relevant documents found. Please upload files first.")
+            # Offer fuzzy suggestions
+            suggestions = suggest_similar_terms(optimized_query)
+            if suggestions:
+                st.info("No exact matches found. Similar items:")
+                for s in suggestions:
+                    if st.button(f"🔎 {s}", key=f"sugg_{s}"):
+                        st.session_state.trigger_search = s
+                        st.rerun()
+            else:
+                status_text.text("⚠️ No relevant documents found. Please upload files first.")
+                st.warning("No documents found in the database. Please upload files first using the 'Files' tab.")
             progress_bar.progress(100)
-            st.warning("No documents found in the database. Please upload files first using the 'Files' tab.")
             return
         
-        # Execute based on route
-        route_name = route.get("route", "unknown") if isinstance(route, dict) else route
-        
-        # Execute based on route
+        # Execute based on SLM route with enhanced parameters
+        route_name = route_result.get("route", "llm_explain")
         status_text.text(f"🤖 Processing via {route_name}...")
         progress_bar.progress(60)
-        
-        if route_name == "agent":
-            result = agent_tools.execute_pandas_query(optimized_query, results)
-        elif route_name == "llm_reason":
-            result = llm_reasoning.perform_reasoning(optimized_query, results)
-        elif route_name == "llm_explain":
-            result = llm_reasoning.generate_explanation(optimized_query, results)
-        elif route_name == "slm_parse":
-            # For SLM parsing, we'll use the reasoning method with SLM model
-            result = llm_reasoning.perform_reasoning(optimized_query, results)
-        else:
-            result = {"response": f"Query processed via {route_name}", "route": route_name}
+
+        result = None
+        try:
+            if route_name == "agent":
+                # Use SLM-extracted operation and equipment for better agent execution
+                operation = route_result.get('operation', '')
+                equipment = route_result.get('equipment', [])
+                metric = route_result.get('metric', '')
+                
+                # Use enhanced pandas operation if we have SLM parameters
+                if operation and metric and equipment:
+                    result = agent_tools.execute_pandas_operation(operation, metric, equipment, None, results)
+                else:
+                    # Fallback to original query - use pandas operation with basic parameters
+                    result = agent_tools.execute_pandas_operation('sum', 'energy', [], None, results)
+            elif route_name == "llm_reason":
+                result = llm_reasoning.perform_reasoning(optimized_query, results)
+            elif route_name == "llm_explain":
+                result = llm_reasoning.generate_explanation(optimized_query, results)
+            elif route_name == "slm_parse":
+                result = llm_reasoning.perform_reasoning(optimized_query, results)
+        except Exception:
+            result = None
+
+        # Fallback to RAG + LLM if no usable result
+        if not result:
+            status_text.text("🧠 Falling back to RAG + LLM...")
+            progress_bar.progress(75)
+            rag_results = embedding_store.search(search_terms, k=5)
+            if not rag_results:
+                st.warning("No relevant documents found. Try adjusting filters or uploading more data.")
+                progress_bar.progress(100)
+                return
+            result = llm_reasoning.generate_explanation(
+                "Answer precisely using the provided context. Cite facts; avoid speculation.", rag_results
+            )
         
         progress_bar.progress(80)
         status_text.text("✅ Processing complete!")
@@ -551,11 +772,14 @@ def execute_advanced_search(query: str):
             st.session_state.user_id,
             st.session_state.session_id,
             query,
-            route,
+            route_name,
             processing_time,
             True,
             len(results)
         )
+        
+        # Store last query for response generator
+        st.session_state.last_query = query
         
         # Add to conversation history
         st.session_state.conversation_history.append({
@@ -592,51 +816,17 @@ def display_search_results(result: Dict, results: List, route: str,
                          processing_time: float, verification: Dict):
     """Display search results with enhanced formatting"""
     
-    # Main result
-    st.markdown("### 📊 Search Results")
+    # Generate proper response using response generator
+    route_info = {"route": route, "processing_time": processing_time}
+    response_text = response_generator.generate_response(
+        st.session_state.get('last_query', 'Unknown query'),
+        result,
+        results,
+        route_info
+    )
     
-    # Create a main container for better alignment
-    with st.container():
-        col1, col2, col3 = st.columns([2, 1, 1])
-        
-        with col1:
-            st.markdown(f"**Route:** {route}")
-        with col2:
-            st.metric("Processing Time", f"{processing_time:.2f}s")
-        with col3:
-            st.metric("Results Found", len(results))
-        
-        st.markdown("---")  # Separator line
-        
-        # Response section with proper container
-        st.markdown("**🤖 Response:**")
-        response_text = result.get("response", result.get("answer", result.get("result", "No response")))
-        
-        # Use a proper container for the response
-        with st.container():
-            st.markdown(f'<div class="response-container"><div class="success-message">{response_text}</div></div>', 
-                        unsafe_allow_html=True)
-        
-        # Verification section
-        if verification.get("verified", False):
-            st.markdown("**✅ Verification:**")
-            with st.container():
-                st.markdown(f'<div class="response-container"><div class="info-message">{verification.get("explanation", "")}</div></div>', 
-                            unsafe_allow_html=True)
-    
-    # Source documents
-    if results:
-        st.markdown("**📚 Source Documents:**")
-        
-        with st.container():
-            for i, doc in enumerate(results):
-                with st.expander(f"Document {i+1}: {doc.get('file_name', 'Unknown')} (Score: {doc.get('score', 0):.3f})"):
-                    st.markdown(f"**Type:** {doc.get('doc_type', 'Unknown')}")
-                    st.markdown(f"**Content:** {doc.get('content', 'No content')[:500]}...")
-                    
-                    if doc.get('metadata'):
-                        st.markdown("**Metadata:**")
-                        st.json(doc['metadata'])
+    # Display the formatted response
+    st.markdown(response_text)
     
     # Save query option
     if st.button("💾 Save Query"):
@@ -793,16 +983,30 @@ def render_pinned_kpis():
         selected_files = []
         st.warning("No files available. Please upload files first.")
     
-    # Date range selection
-    col_date1, col_date2 = st.columns(2)
-    with col_date1:
-        start_date = st.date_input("📅 Start Date", value=None, help="Filter data from this date")
-    with col_date2:
-        end_date = st.date_input("📅 End Date", value=None, help="Filter data until this date")
+    # Date range selection (optional - can be cleared)
+    col_date1, col_date2, col_clear = st.columns([1, 1, 0.5])
     
+    with col_date1:
+        start_date = st.date_input("📅 Start Date", value=None, help="Filter data from this date (optional)")
+    with col_date2:
+        end_date = st.date_input("📅 End Date", value=None, help="Filter data until this date (optional)")
+    with col_clear:
+        if st.button("🗑️ Clear Dates", help="Clear date filters"):
+            # Clear any cached data that depends on dates
+            if 'kpi_data' in st.session_state:
+                del st.session_state['kpi_data']
+            st.rerun()
+    
+    # Only use date range if both dates are selected
     date_range = (start_date, end_date) if start_date and end_date else None
     
-    # Get real-time data with filters
+    # Show current filter status
+    if date_range:
+        st.info(f"📅 Filtering data from {start_date} to {end_date}")
+    else:
+        st.info("📅 Showing all available data (no date filter applied)")
+    
+    # Get real-time data with filters (force cache refresh on change)
     kpi_data = get_real_time_kpis(selected_files, date_range)
     
     # Create columns for KPIs
@@ -863,6 +1067,33 @@ def get_available_files():
         st.error(f"Error fetching files: {e}")
         return []
 
+@st.cache_data(ttl=300)
+def get_last_known_date():
+    """Scan recent row contents for the most recent date present (best effort)."""
+    try:
+        conn = sqlite3.connect('data_prototype/metadata.db')
+        cursor = conn.cursor()
+        cursor.execute("SELECT content FROM documents WHERE doc_type='row' ORDER BY rowid DESC LIMIT 2000")
+        rows = [r[0] for r in cursor.fetchall()]
+        conn.close()
+        import re, datetime as _dt
+        latest = None
+        for c in rows:
+            for m in re.findall(r"(\d{4}[-/](\d{2})[-/](\d{2}))|(\d{2}[-/](\d{2})[-/](\d{4}))", c):
+                s = ''.join(m)
+                s = s.replace('/', '-')
+                if not s:
+                    continue
+                try:
+                    d = _dt.date.fromisoformat(s if len(s.split('-')[0])==4 else '-'.join(reversed(s.split('-'))))
+                    if latest is None or d > latest:
+                        latest = d
+                except Exception:
+                    continue
+        return latest
+    except Exception:
+        return None
+
 @st.cache_data(ttl=300)  # Cache for 5 minutes
 def get_file_ids_by_names(file_names):
     """Get file IDs for given file names"""
@@ -905,22 +1136,30 @@ def get_real_time_kpis(selected_files=None, date_range=None):
         # Check if documents table exists
         cursor.execute("SELECT name FROM sqlite_master WHERE type='table' AND name='documents'")
         if cursor.fetchone():
-            # Build query with filters
-            query = "SELECT COUNT(*) FROM documents WHERE doc_type = 'row'"
-            params = []
+            # Calculate real KPIs from actual data with optional filters
+            kpi_data = calculate_dynamic_kpis(conn, selected_files, date_range)
             
-            if selected_files:
-                placeholders = ','.join(['?' for _ in selected_files])
-                query += f" AND file_name IN ({placeholders})"
-                params.extend(selected_files)
-            
-            cursor.execute(query, params)
-            doc_count = cursor.fetchone()[0]
-            
-            if doc_count > 0:
-                # Calculate real KPIs from actual data
-                kpi_data = calculate_dynamic_kpis(conn, selected_files, date_range)
-                kpi_data['last_update'] = '2 min ago'
+            # Get actual last update time from database
+            cursor.execute("SELECT MAX(created_at) FROM documents")
+            last_update_result = cursor.fetchone()
+            if last_update_result and last_update_result[0]:
+                from datetime import datetime
+                last_update_time = datetime.fromisoformat(last_update_result[0].replace('Z', '+00:00'))
+                now = datetime.now()
+                time_diff = now - last_update_time.replace(tzinfo=None)
+                
+                if time_diff.days > 0:
+                    kpi_data['last_update'] = f"{time_diff.days} day(s) ago"
+                elif time_diff.seconds > 3600:
+                    hours = time_diff.seconds // 3600
+                    kpi_data['last_update'] = f"{hours} hour(s) ago"
+                elif time_diff.seconds > 60:
+                    minutes = time_diff.seconds // 60
+                    kpi_data['last_update'] = f"{minutes} minute(s) ago"
+                else:
+                    kpi_data['last_update'] = "Just now"
+            else:
+                kpi_data['last_update'] = 'No recent data'
         
         conn.close()
         
@@ -942,53 +1181,87 @@ def get_real_time_kpis(selected_files=None, date_range=None):
         }
 
 def calculate_dynamic_kpis(conn, selected_files=None, date_range=None):
-    """Calculate KPIs from actual database data"""
+    """Calculate KPIs from actual database data (file/date aware)"""
     cursor = conn.cursor()
-    
-    # Build base query
-    query = "SELECT content FROM documents WHERE doc_type = 'row'"
-    params = []
-    
+
+    # Filter by files
+    file_clause = ""
+    params: list = []
     if selected_files:
         placeholders = ','.join(['?' for _ in selected_files])
-        query += f" AND file_name IN ({placeholders})"
+        file_clause = f" AND file_name IN ({placeholders})"
         params.extend(selected_files)
-    
-    cursor.execute(query, params)
+
+    # Pull recent rows (limit for performance)
+    cursor.execute(
+        f"SELECT content, file_name FROM documents WHERE doc_type='row' {file_clause} LIMIT 2000",
+        params
+    )
     rows = cursor.fetchall()
+
+    # Optional date filtering from free text content (best-effort)
+    import re, datetime as _dt
+    def in_range(text: str) -> bool:
+        if not date_range or not all(date_range):
+            return True
+        m = re.search(r"(\d{4}[-/](\d{2})[-/](\d{2}))|(\d{2}[-/](\d{2})[-/](\d{4}))", text)
+        if not m:
+            return True
+        s = m.group(0).replace('/', '-')
+        try:
+            d = _dt.date.fromisoformat(s if len(s.split('-')[0])==4 else '-'.join(reversed(s.split('-'))))
+            return date_range[0] <= d <= date_range[1]
+        except Exception:
+            return True
+
+    filtered_rows = [(c, f) for (c, f) in rows if in_range(c)]
+
+    # Parse energy-like values with improved pattern matching
+    total_energy = 0.0
+    count_energy = 0
+    equipment_seen = set()
     
-    # Parse energy values from content
-    total_energy = 0
-    energy_values = []
-    
-    for row in rows:
-        content = row[0]
-        # Extract numeric values from content
-        import re
-        numbers = re.findall(r'\d+\.?\d*', content)
-        for num in numbers:
-            try:
-                val = float(num)
-                if 1000 < val < 1000000:  # Reasonable energy range
-                    energy_values.append(val)
-                    total_energy += val
-            except:
-                continue
-    
-    # Calculate KPIs
-    avg_energy = total_energy / len(energy_values) if energy_values else 0
-    active_equipment = len(set([row[0] for row in rows])) if rows else 0
-    
+    # More flexible energy pattern - look for numbers that could be energy values
+    energy_patterns = [
+        re.compile(r"\b(\d{1,6})(?:\.\d+)?\s*(?:kwh|kwh|energy|consumption)", re.IGNORECASE),
+        re.compile(r"\b(\d{1,6})(?:\.\d+)?\b"),  # Any reasonable number
+        re.compile(r"(\d{1,6})(?:\.\d+)?\s*(?:kwh|kwh)", re.IGNORECASE)
+    ]
+
+    for content, file_name in filtered_rows:
+        # Extract equipment tokens
+        for token in re.findall(r"[A-Za-z0-9_/.-]+", content)[:10]:
+            equipment_seen.add(token)
+        
+        # Try multiple patterns to find energy values
+        found_energy = False
+        for pattern in energy_patterns:
+            if found_energy:
+                break
+            for match in pattern.findall(content):
+                try:
+                    val = float(match)
+                    # More flexible range for energy values
+                    if 1 <= val <= 1000000:  # Reasonable energy range
+                        total_energy += val
+                        count_energy += 1
+                        found_energy = True
+                        break  # Only count once per content
+                except Exception:
+                    continue
+
+    avg_energy = (total_energy / count_energy) if count_energy else 0.0
+
     return {
         'total_energy': int(total_energy),
-        'energy_delta': 5.2,  # Placeholder
-        'active_equipment': active_equipment,
-        'total_equipment': 15,
-        'equipment_delta': 2,
-        'efficiency': min(100, (avg_energy / 1000) * 10) if avg_energy > 0 else 0,
-        'efficiency_delta': 1.8,
-        'alerts': 3,
-        'alerts_delta': -2,
+        'energy_delta': 0.0,
+        'active_equipment': max(0, min(len(equipment_seen), 50)),
+        'total_equipment': max(1, len(equipment_seen) or 15),
+        'equipment_delta': 0,
+        'efficiency': round(min(100.0, (avg_energy / 1000.0) * 10.0), 1) if avg_energy else 0.0,
+        'efficiency_delta': 0.0,
+        'alerts': 0,
+        'alerts_delta': 0,
         'last_update': 'Live data'
     }
 
@@ -1048,10 +1321,13 @@ def render_daily_briefing():
         st.markdown("**⚡ Quick Actions**")
         if st.button("📊 View Energy Trends"):
             st.session_state.show_energy_charts = True
-    if st.button("🔍 Search Equipment"):
-        # Use a different approach to trigger search
-        st.session_state.trigger_search = "equipment status"
-        st.rerun()
+        # Equipment quick search opens a picker and triggers a prefilled query
+        with st.popover("🔍 Search Equipment"):
+            eq = st.text_input("Equipment name", placeholder="e.g., I/C Panel, COP-2 battery A")
+            if st.button("Search this equipment", key="eq_go"):
+                if eq:
+                    st.session_state.trigger_search = f"equipment status {eq}"
+                    st.rerun()
         if st.button("📱 Send Alert"):
             st.info("Alert system coming soon!")
 
@@ -1076,7 +1352,10 @@ def generate_daily_briefing(selected_files=None, date_range=None, briefing_type=
         # Filter by selected files if provided
         file_ids = get_file_ids_by_names(selected_files) if selected_files else None
         file_id_filter = file_ids[0] if file_ids and len(file_ids) > 0 else None
-        recent_docs = embedding_store.search(query, k=5, file_id_filter=file_id_filter)
+        
+        # Extract search terms for better matching
+        search_terms = extract_search_terms_fallback(query)
+        recent_docs = embedding_store.search(search_terms, k=5, file_id_filter=file_id_filter)
         
         if not recent_docs:
             return "No recent data available for briefing generation."
@@ -1118,40 +1397,372 @@ def generate_daily_briefing(selected_files=None, date_range=None, briefing_type=
         return f"Error generating briefing: {str(e)}"
 
 def render_energy_charts():
-    """Render energy consumption charts and trends"""
+    """Render dynamic energy consumption charts and trends"""
     st.markdown("### 📈 Energy Consumption Analytics")
     
-    # Sample data for demonstration
-    import pandas as pd
-    import numpy as np
+    # File selection for charts
+    available_files = get_available_files()
+    if available_files:
+        chart_files = st.multiselect(
+            "📁 Select Files for Charts",
+            available_files,
+            default=available_files[:1] if available_files else [],
+            help="Choose which files to include in the energy analytics"
+        )
+    else:
+        chart_files = []
+        st.warning("No files available. Please upload files first.")
     
-    # Generate sample data
-    dates = pd.date_range(start='2024-01-01', end='2024-01-31', freq='D')
-    energy_data = pd.DataFrame({
-        'Date': dates,
-        'Total_Consumption': np.random.normal(100000, 10000, len(dates)),
-        'Peak_Demand': np.random.normal(120000, 15000, len(dates)),
-        'Efficiency': np.random.normal(94, 2, len(dates))
-    })
+    # Date range selection for charts
+    col_date1, col_date2, col_chart_type, col_refresh = st.columns([1, 1, 1, 0.5])
     
-    # Energy consumption trend
-    st.markdown("**⚡ Daily Energy Consumption Trend**")
-    st.line_chart(energy_data.set_index('Date')['Total_Consumption'])
+    with col_date1:
+        chart_start_date = st.date_input("📅 Chart Start Date", value=None, help="Start date for energy analysis (optional)")
+    with col_date2:
+        chart_end_date = st.date_input("📅 Chart End Date", value=None, help="End date for energy analysis (optional)")
+    with col_chart_type:
+        chart_type = st.selectbox("📊 Chart Type", ["Line Chart", "Bar Chart", "Area Chart"], help="Choose visualization type")
+    with col_refresh:
+        if st.button("🔄 Refresh", help="Refresh data and clear cache"):
+            st.cache_data.clear()
+            st.rerun()
     
-    # Efficiency metrics
-    col1, col2 = st.columns(2)
+    # Only use date range if both dates are selected
+    chart_date_range = (chart_start_date, chart_end_date) if chart_start_date and chart_end_date else None
     
-    with col1:
-        st.markdown("**📊 Peak Demand**")
-        st.bar_chart(energy_data.set_index('Date')['Peak_Demand'])
+    # Get dynamic energy data
+    energy_data = get_dynamic_energy_data(chart_files, chart_date_range)
     
-    with col2:
-        st.markdown("**🎯 Efficiency Rate**")
-        st.line_chart(energy_data.set_index('Date')['Efficiency'])
+    if not energy_data.empty:
+        # Energy consumption trend
+        st.markdown("**⚡ Energy Consumption Analysis**")
+        
+        # Create interactive charts using Plotly for better visualization
+        import plotly.express as px
+        import plotly.graph_objects as go
+        
+        if chart_type == "Line Chart":
+            fig = px.line(energy_data, x='Date', y='Total_Consumption', 
+                         title='Energy Consumption Trend',
+                         labels={'Total_Consumption': 'Energy Consumption (kWh)', 'Date': 'Date'})
+            fig.update_layout(height=400)
+            st.plotly_chart(fig, use_container_width=True)
+        elif chart_type == "Bar Chart":
+            fig = px.bar(energy_data, x='Date', y='Total_Consumption',
+                        title='Energy Consumption by Date',
+                        labels={'Total_Consumption': 'Energy Consumption (kWh)', 'Date': 'Date'})
+            fig.update_layout(height=400)
+            st.plotly_chart(fig, use_container_width=True)
+        else:  # Area Chart
+            fig = px.area(energy_data, x='Date', y='Total_Consumption',
+                         title='Energy Consumption Area Chart',
+                         labels={'Total_Consumption': 'Energy Consumption (kWh)', 'Date': 'Date'})
+            fig.update_layout(height=400)
+            st.plotly_chart(fig, use_container_width=True)
+        
+        # Equipment breakdown
+        col1, col2 = st.columns(2)
+        
+        with col1:
+            st.markdown("**🏭 Equipment Energy Distribution**")
+            if 'Equipment' in energy_data.columns:
+                # Get detailed equipment data from original records
+                equipment_data = get_equipment_energy_breakdown(chart_files, chart_date_range)
+                if not equipment_data.empty:
+                    fig_equipment = px.pie(equipment_data, values='Total_Consumption', names='Equipment',
+                                         title='Energy Distribution by Equipment')
+                    fig_equipment.update_layout(height=400)
+                    st.plotly_chart(fig_equipment, use_container_width=True)
+                else:
+                    st.info("Equipment breakdown not available")
+            else:
+                st.info("Equipment breakdown not available")
+        
+        with col2:
+            st.markdown("**📊 Energy Efficiency Trends**")
+            if 'Efficiency' in energy_data.columns:
+                fig_efficiency = px.line(energy_data, x='Date', y='Efficiency',
+                                       title='Energy Efficiency Over Time',
+                                       labels={'Efficiency': 'Efficiency (%)', 'Date': 'Date'})
+                fig_efficiency.update_layout(height=400)
+                st.plotly_chart(fig_efficiency, use_container_width=True)
+            else:
+                # Calculate efficiency from consumption data
+                efficiency_data = energy_data.copy()
+                efficiency_data['Efficiency'] = (efficiency_data['Total_Consumption'] / efficiency_data['Total_Consumption'].max()) * 100
+                fig_efficiency = px.line(efficiency_data, x='Date', y='Efficiency',
+                                       title='Calculated Efficiency Over Time',
+                                       labels={'Efficiency': 'Efficiency (%)', 'Date': 'Date'})
+                fig_efficiency.update_layout(height=400)
+                st.plotly_chart(fig_efficiency, use_container_width=True)
+        
+        # Advanced Analytics
+        st.markdown("**🔍 Advanced Analytics**")
+        
+        # Trend analysis
+        if len(energy_data) > 1:
+            energy_data_sorted = energy_data.sort_values('Date')
+            trend = "📈 Increasing" if energy_data_sorted['Total_Consumption'].iloc[-1] > energy_data_sorted['Total_Consumption'].iloc[0] else "📉 Decreasing"
+            st.info(f"**Energy Trend**: {trend}")
+        
+        # Summary statistics with enhanced metrics
+        st.markdown("**📈 Summary Statistics**")
+        col1, col2, col3, col4 = st.columns(4)
+        
+        total_energy = energy_data['Total_Consumption'].sum()
+        avg_daily = energy_data['Total_Consumption'].mean()
+        peak_consumption = energy_data['Total_Consumption'].max()
+        min_consumption = energy_data['Total_Consumption'].min()
+        
+        with col1:
+            st.metric("Total Energy", f"{total_energy:,.0f} kWh", 
+                     delta=f"{((total_energy/1000)-864):.0f}% vs baseline" if total_energy > 0 else None)
+        with col2:
+            st.metric("Average Daily", f"{avg_daily:,.0f} kWh", 
+                     delta=f"{((avg_daily/1000)-8.6):.1f}% vs baseline" if avg_daily > 0 else None)
+        with col3:
+            st.metric("Peak Consumption", f"{peak_consumption:,.0f} kWh")
+        with col4:
+            st.metric("Data Points", len(energy_data))
+        
+        # Energy efficiency insights
+        st.markdown("**💡 Energy Insights**")
+        col1, col2 = st.columns(2)
+        
+        with col1:
+            efficiency_score = (avg_daily / peak_consumption) * 100 if peak_consumption > 0 else 0
+            st.metric("Efficiency Score", f"{efficiency_score:.1f}%", 
+                     delta="Good" if efficiency_score > 80 else "Needs Improvement")
+        
+        with col2:
+            energy_variance = energy_data['Total_Consumption'].std()
+            st.metric("Energy Variance", f"{energy_variance:,.0f} kWh", 
+                     delta="Stable" if energy_variance < avg_daily * 0.2 else "Variable")
+        
+        # Equipment performance table
+        if 'Equipment' in energy_data.columns:
+            st.markdown("**🏭 Equipment Performance**")
+            equipment_performance = energy_data.groupby('Equipment').agg({
+                'Total_Consumption': ['sum', 'mean', 'count']
+            }).round(2)
+            equipment_performance.columns = ['Total Energy (kWh)', 'Average (kWh)', 'Records']
+            equipment_performance = equipment_performance.sort_values('Total Energy (kWh)', ascending=False)
+            st.dataframe(equipment_performance, use_container_width=True)
+            
+    else:
+        st.warning("No energy data available for the selected files and date range.")
+        st.info("💡 Try selecting different files or adjusting the date range.")
+
+@st.cache_data(ttl=300)  # Cache for 5 minutes
+def get_dynamic_energy_data(selected_files=None, date_range=None):
+    """Get dynamic energy data from database for charts"""
+    try:
+        import pandas as pd
+        import sqlite3
+        import re
+        from datetime import datetime
+        
+        conn = sqlite3.connect('data_prototype/metadata.db')
+        cursor = conn.cursor()
+        
+        # Filter by files
+        file_clause = ""
+        params = []
+        if selected_files:
+            placeholders = ','.join(['?' for _ in selected_files])
+            file_clause = f" AND file_name IN ({placeholders})"
+            params.extend(selected_files)
+        
+        # Get documents with energy data
+        cursor.execute(
+            f"SELECT content, file_name, doc_id FROM documents WHERE doc_type='row' {file_clause} ORDER BY doc_id",
+            params
+        )
+        rows = cursor.fetchall()
+        conn.close()
+        
+        if not rows:
+            return pd.DataFrame()
+        
+        # Process energy data
+        energy_records = []
+        equipment_pattern = re.compile(r'([A-Z]{2,4}\s+[A-Z/]+(?:\s+[A-Z0-9-]+)*)', re.IGNORECASE)
+        energy_patterns = [
+            re.compile(r'\b(\d{1,6})(?:\.\d+)?\s*(?:kwh|kwh|energy|consumption)', re.IGNORECASE),
+            re.compile(r'\b(\d{1,6})(?:\.\d+)?\b'),
+        ]
+        
+        for content, file_name, doc_id in rows:
+            # Extract equipment names
+            equipment_matches = equipment_pattern.findall(content)
+            equipment = equipment_matches[0] if equipment_matches else "Unknown Equipment"
+            
+            # Extract energy values
+            energy_values = []
+            for pattern in energy_patterns:
+                matches = pattern.findall(content)
+                for match in matches:
+                    try:
+                        val = float(match)
+                        if 1 <= val <= 1000000:  # Reasonable energy range
+                            energy_values.append(val)
+                            break  # Only take first valid value
+                    except:
+                        continue
+            
+            if energy_values:
+                # Use current date since we don't have created_at
+                date_str = datetime.now().strftime('%Y-%m-%d')
+                
+                energy_records.append({
+                    'Date': date_str,
+                    'Total_Consumption': energy_values[0],
+                    'Equipment': equipment,
+                    'File': file_name,
+                    'Efficiency': min(100.0, (energy_values[0] / 1000.0) * 10.0) if energy_values[0] else 0.0
+                })
+        
+        if not energy_records:
+            return pd.DataFrame()
+        
+        # Create DataFrame
+        df = pd.DataFrame(energy_records)
+        df['Date'] = pd.to_datetime(df['Date'])
+        
+        # Apply date filtering if provided
+        if date_range and len(date_range) == 2:
+            start_date, end_date = date_range
+            df = df[(df['Date'].dt.date >= start_date) & (df['Date'].dt.date <= end_date)]
+        
+        # Group by date and sum consumption
+        daily_energy = df.groupby('Date').agg({
+            'Total_Consumption': 'sum',
+            'Equipment': lambda x: ', '.join(x.unique()),
+            'Efficiency': 'mean'
+        }).reset_index()
+        
+        return daily_energy
+        
+    except Exception as e:
+        st.error(f"Error getting energy data: {e}")
+        return pd.DataFrame()
+
+@st.cache_data(ttl=300)  # Cache for 5 minutes
+def get_equipment_energy_breakdown(selected_files=None, date_range=None):
+    """Get equipment-specific energy breakdown for pie charts"""
+    try:
+        import pandas as pd
+        import sqlite3
+        import re
+        from datetime import datetime
+        
+        conn = sqlite3.connect('data_prototype/metadata.db')
+        cursor = conn.cursor()
+        
+        # Filter by files
+        file_clause = ""
+        params = []
+        if selected_files:
+            placeholders = ','.join(['?' for _ in selected_files])
+            file_clause = f" AND file_name IN ({placeholders})"
+            params.extend(selected_files)
+        
+        # Get documents with energy data
+        cursor.execute(
+            f"SELECT content, file_name, doc_id FROM documents WHERE doc_type='row' {file_clause} ORDER BY doc_id",
+            params
+        )
+        rows = cursor.fetchall()
+        conn.close()
+        
+        if not rows:
+            return pd.DataFrame()
+        
+        # Process equipment energy data
+        equipment_energy = {}
+        equipment_pattern = re.compile(r'([A-Z]{2,4}\s+[A-Z/]+(?:\s+[A-Z0-9-]+)*)', re.IGNORECASE)
+        energy_patterns = [
+            re.compile(r'\b(\d{1,6})(?:\.\d+)?\s*(?:kwh|kwh|energy|consumption)', re.IGNORECASE),
+            re.compile(r'\b(\d{1,6})(?:\.\d+)?\b'),
+        ]
+        
+        for content, file_name, doc_id in rows:
+            # Extract equipment names
+            equipment_matches = equipment_pattern.findall(content)
+            equipment = equipment_matches[0] if equipment_matches else "Unknown Equipment"
+            
+            # Extract energy values
+            energy_values = []
+            for pattern in energy_patterns:
+                matches = pattern.findall(content)
+                for match in matches:
+                    try:
+                        val = float(match)
+                        if 1 <= val <= 1000000:  # Reasonable energy range
+                            energy_values.append(val)
+                            break  # Only take first valid value
+                    except:
+                        continue
+            
+            if energy_values:
+                if equipment in equipment_energy:
+                    equipment_energy[equipment] += energy_values[0]
+                else:
+                    equipment_energy[equipment] = energy_values[0]
+        
+        if not equipment_energy:
+            return pd.DataFrame()
+        
+        # Create DataFrame for pie chart
+        equipment_data = []
+        for equipment, total_energy in equipment_energy.items():
+            equipment_data.append({
+                'Equipment': equipment,
+                'Total_Consumption': total_energy
+            })
+        
+        df = pd.DataFrame(equipment_data)
+        df = df.sort_values('Total_Consumption', ascending=False).head(10)  # Top 10 equipment
+        
+        return df
+        
+    except Exception as e:
+        st.error(f"Error getting equipment breakdown: {e}")
+        return pd.DataFrame()
 
 def render_live_chat():
     """Render live chat interface with streaming"""
     st.markdown("### 💬 Live Industrial Assistant")
+    
+    # Add KPI suggestions above chat
+    try:
+        from kpi_suggestion_system import KPISuggestionSystem
+        kpi_system = KPISuggestionSystem()
+        suggestions = kpi_system.get_contextual_suggestions("energy consumption")
+        
+        if suggestions:
+            st.markdown("**💡 Quick Suggestions:**")
+            cols = st.columns(3)
+            for i, suggestion in enumerate(suggestions[:3]):  # Show top 3
+                with cols[i % 3]:
+                    if st.button(f"💡 {suggestion}", key=f"chat_kpi_suggestion_{i}"):
+                        # Pre-fill the chat input with the suggestion
+                        st.session_state.chat_input_key = suggestion
+                        st.rerun()
+    except Exception as e:
+        # Fallback suggestions if KPI system fails
+        st.markdown("**💡 Quick Suggestions:**")
+        cols = st.columns(3)
+        fallback_suggestions = [
+            "Show total energy consumption",
+            "Compare energy by equipment", 
+            "Show daily energy trends"
+        ]
+        for i, suggestion in enumerate(fallback_suggestions):
+            with cols[i % 3]:
+                if st.button(f"💡 {suggestion}", key=f"chat_fallback_suggestion_{i}"):
+                    st.session_state.chat_input_key = suggestion
+                    st.rerun()
     
     # Chat interface
     if "messages" not in st.session_state:
@@ -1162,8 +1773,14 @@ def render_live_chat():
         with st.chat_message(message["role"]):
             st.markdown(message["content"])
     
-    # Chat input
-    if prompt := st.chat_input("Ask about plant operations, equipment status, or energy consumption..."):
+    # Chat input with pre-filled suggestion
+    default_chat_input = st.session_state.get('chat_input_key', '')
+    if default_chat_input:
+        del st.session_state.chat_input_key # Clear after use
+    
+    if prompt := st.chat_input(
+        "Ask about plant operations, equipment status, or energy consumption..."
+    ):
         # Add user message
         st.session_state.messages.append({"role": "user", "content": prompt})
         
@@ -1192,9 +1809,10 @@ def render_live_chat():
 def generate_streaming_response(prompt):
     """Generate streaming response for live chat"""
     try:
-        # Get relevant context
+        # Get relevant context using extracted search terms
         embedding_store = EmbeddingStore()
-        results = embedding_store.search(prompt, k=3)
+        search_terms = extract_search_terms_fallback(prompt)
+        results = embedding_store.search(search_terms, k=3)
         
         if not results:
             yield "I don't have access to current plant data. Please upload files first to get real-time assistance."
@@ -1263,7 +1881,7 @@ def render_runtime_monitoring():
     import pandas as pd
     import numpy as np
     
-    timestamps = pd.date_range(start='2024-01-01', periods=24, freq='H')
+    timestamps = pd.date_range(start='2024-01-01', periods=24, freq='h')
     performance_data = pd.DataFrame({
         'Time': timestamps,
         'Router': np.random.normal(50, 10, 24),
@@ -1293,9 +1911,18 @@ def main():
     # Pinned KPIs - Always visible at top with auto-refresh
     render_pinned_kpis()
     
-    # Auto-refresh every 30 seconds
-    if st.button("🔄 Refresh KPIs", key="refresh_kpis"):
-        st.rerun()
+    # Cache controls
+    colr1, colr2 = st.columns([1,1])
+    with colr1:
+        if st.button("🔄 Refresh KPIs", key="refresh_kpis"):
+            st.cache_data.clear()
+            st.rerun()
+    with colr2:
+        if st.button("🧹 Clear All Cache & Session", key="clear_all"):
+            st.cache_data.clear()
+            for k in list(st.session_state.keys()):
+                del st.session_state[k]
+            st.rerun()
     
     # Auto-refresh placeholder
     placeholder = st.empty()
@@ -1359,14 +1986,26 @@ def main():
                 status_text.text("📄 Processing file structure...")
                 progress_bar.progress(10)
                 
-                documents = ingest_file(file_path, row_limit=20)  # Limit for testing
+                # Deduplicate per content hash to avoid re-ingestion
+                with open(file_path, 'rb') as fh:
+                    content_hash = hashlib.md5(fh.read()).hexdigest()
+                conn = sqlite3.connect('data_prototype/metadata.db')
+                cursor = conn.cursor()
+                cursor.execute("SELECT COUNT(*) FROM documents WHERE file_name = ?", (uploaded_file.name,))
+                already = cursor.fetchone()[0]
+                conn.close()
+                if already > 0:
+                    documents = []  # skip ingestion; file already present
+                else:
+                    documents = ingest_file(file_path, row_limit=20)  # Limit for testing
                 
                 # Step 2: Adding to embedding store
                 status_text.text("🔍 Generating embeddings...")
                 progress_bar.progress(50)
                 
                 embedding_store = EmbeddingStore()
-                embedding_store.add_documents(documents)
+                if documents:
+                    embedding_store.add_documents(documents)
                 
                 # Step 3: Finalizing
                 status_text.text("✅ Finalizing...")

@@ -12,8 +12,8 @@ class LLMReasoning:
     a comprehensive response.
     """
     def __init__(self):
-        self.reasoning_model = LLM_REASON_MODEL
-        self.explanation_model = LLM_EXPLAIN_MODEL
+        self.reasoning_model = LLM_REASON_MODEL  # Use actual model name
+        self.explanation_model = LLM_EXPLAIN_MODEL  # Use actual model name
         logger.info(f"LLMReasoning initialized with reasoning model: {self.reasoning_model} and explanation model: {self.explanation_model}")
 
     def _call_ollama_llm(self, prompt: str, model: str, temperature: float = 0.2) -> str:
@@ -39,24 +39,34 @@ class LLMReasoning:
                 logger.error(f"Ollama error response body: {e.response.text}")
             return f"LLM Error: Could not get response from LLM model {model}."
 
-    def perform_reasoning(self, query: str, context: List[Dict[str, Any]]) -> Dict[str, Any]:
+    def perform_reasoning(self, query: str, context: List[Dict[str, Any]], chat_history: List[Dict[str, str]] = None) -> Dict[str, Any]:
         """
-        Generates a reasoned answer based on the query and provided context.
+        Generates a reasoned answer based on the query, provided context, and chat history.
         """
         context_str = "\n---\n".join([f"Document ID: {d.get('doc_id', 'N/A')}\nContent: {d.get('content', 'N/A')}\nMetadata: {json.dumps(d.get('metadata', {}), indent=2)}" for d in context])
+        
+        history_str = ""
+        if chat_history:
+            for entry in chat_history[-3:]: # Include last 3 turns of conversation
+                history_str += f"\nUser: {entry['query']}\nMendy: {entry['response']}"
 
         prompt = f"""
-        You are an advanced AI assistant capable of complex reasoning and analysis.
-        Analyze the provided context documents to answer the following query.
+        You are Mendy, an advanced industrial AI assistant capable of complex reasoning and analysis.
+        Your goal is to provide helpful, human-like, and concise responses.
+        Analyze the provided context documents and previous conversation to answer the user's query.
         Synthesize information from multiple documents if necessary. Provide a detailed, well-reasoned answer.
-        Also, clearly state the provenance (Document IDs) for the information you use.
+        Always maintain a friendly and professional tone. If you cannot find a direct answer, try to guide the user.
+        Clearly state the provenance (Document IDs) for the information you use.
+
+        Previous Conversation (if any):
+        {history_str}
 
         Query: "{query}"
 
         Context Documents:
         {context_str}
 
-        Reasoned Answer:
+        Reasoned Answer from Mendy:
         """
         logger.info(f"Performing reasoning for query (first 50 chars): {query[:50]}...")
         reasoned_answer = self._call_ollama_llm(prompt, self.reasoning_model)
@@ -73,28 +83,36 @@ class LLMReasoning:
 
         return {
             "answer": reasoned_answer,
-            "type": "natural_language_reasoning",
+            "type": "Mendy-Reasoning", # Branded type
             "provenance": provenance_docs
         }
 
-    def generate_explanation(self, query: str, context: List[Dict[str, Any]]) -> Dict[str, Any]:
+    def generate_explanation(self, query: str, context: List[Dict[str, Any]], chat_history: List[Dict[str, str]] = None) -> Dict[str, Any]:
         """
-        Generates an explanation or summary based on the query and provided context.
+        Generates an explanation or summary based on the query, provided context, and chat history.
         """
         context_str = "\n---\n".join([f"Document ID: {d.get('doc_id', 'N/A')}\nContent: {d.get('content', 'N/A')}\nMetadata: {json.dumps(d.get('metadata', {}), indent=2)}" for d in context])
 
+        history_str = ""
+        if chat_history:
+            for entry in chat_history[-3:]: # Include last 3 turns of conversation
+                history_str += f"\nUser: {entry['query']}\nMendy: {entry['response']}"
+
         prompt = f"""
-        You are an AI assistant designed to provide clear and concise explanations and summaries.
-        Based on the following context documents, provide a comprehensive explanation or summary to answer the query.
-        Ensure your explanation is easy to understand and directly addresses the user's request.
+        You are Mendy, an AI assistant designed to provide clear, concise, and human-like explanations and summaries.
+        Based on the following context documents and previous conversation, provide a comprehensive explanation or summary to answer the query.
+        Ensure your explanation is easy to understand and directly addresses the user's request. Always maintain a friendly and professional tone.
         Cite the Document IDs for the information you use.
+
+        Previous Conversation (if any):
+        {history_str}
 
         Query: "{query}"
 
         Context Documents:
         {context_str}
 
-        Explanation/Summary:
+        Explanation/Summary from Mendy:
         """
         logger.info(f"Generating explanation for query (first 50 chars): {query[:50]}...")
         explanation = self._call_ollama_llm(prompt, self.explanation_model)
@@ -110,7 +128,7 @@ class LLMReasoning:
 
         return {
             "answer": explanation,
-            "type": "natural_language_explanation",
+            "type": "Mendy-Explanation", # Branded type
             "provenance": provenance_docs
         }
 

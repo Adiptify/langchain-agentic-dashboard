@@ -273,9 +273,9 @@ This project is licensed under the MIT License - see the [LICENSE](LICENSE) file
 
 ## 📞 Support
 
-- **Issues**: [GitHub Issues](https://github.com/adiptify/langchain-agentic-dashboard/issues)
-- **Discussions**: [GitHub Discussions](https://github.com/adiptify/langchain-agentic-dashboard/discussions)
-- **Email**: kumar.aditya.prof@gmail.com
+- **Issues**: [GitHub Issues](https://github.com/yourusername/langchain-agentic-dashboard/issues)
+- **Discussions**: [GitHub Discussions](https://github.com/yourusername/langchain-agentic-dashboard/discussions)
+- **Email**: your.email@example.com
 
 ## 🔮 Roadmap
 
@@ -293,6 +293,6 @@ This project is licensed under the MIT License - see the [LICENSE](LICENSE) file
 
 **⭐ Star this repository if you found it helpful!**
 
-Made by [Adiptify](https://github.com/Adiptify)
+Made with ❤️ by [Your Name](https://github.com/yourusername)
 
 </div>
